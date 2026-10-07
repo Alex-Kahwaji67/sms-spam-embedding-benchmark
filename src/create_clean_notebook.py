@@ -3,7 +3,7 @@ from pathlib import Path
 from textwrap import dedent
 
 
-OUTPUT_NOTEBOOK = Path("../notebooks/sms_spam_embedding_benchmark.ipynb")
+OUTPUT_NOTEBOOK = Path(__file__).resolve().parents[1] / "notebooks/sms_spam_embedding_benchmark.ipynb"
 
 
 def markdown(text):
@@ -43,23 +43,26 @@ def main():
         code(
             """
             from pathlib import Path
-            import re
+            import sys
             import time
-            import warnings
 
             import numpy as np
             import pandas as pd
-            from gensim.models import Word2Vec
             from sklearn.feature_extraction.text import TfidfVectorizer
             from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
-            from sklearn.model_selection import cross_val_score, train_test_split
-            from sklearn.neighbors import KNeighborsClassifier
+            from sklearn.model_selection import StratifiedKFold, train_test_split
 
-            warnings.filterwarnings("ignore")
+            # Support kernels started from the repository root or notebooks/.
+            REPO_ROOT = Path.cwd()
+            if not (REPO_ROOT / "src" / "benchmark.py").is_file():
+                REPO_ROOT = REPO_ROOT.parent
+            if not (REPO_ROOT / "src" / "benchmark.py").is_file():
+                raise FileNotFoundError("Start the notebook from the repository root or notebooks/.")
+            sys.path.insert(0, str(REPO_ROOT))
+            from src.benchmark import K_VALUES, MeanWord2Vec, tune_knn
 
-            DATA_PATH = Path("../data/spam.csv")
+            DATA_PATH = REPO_ROOT / "data" / "spam.csv"
             RANDOM_STATE = 42
-            K_VALUES = [1, 3, 5, 7, 11, 21]
             """
         ),
         markdown(
@@ -73,7 +76,7 @@ def main():
             """
             if not DATA_PATH.exists():
                 raise FileNotFoundError(
-                    f"Missing {DATA_PATH}. See ../data/README_DATA.md for download and placement notes."
+                    f"Missing {DATA_PATH}. See data/README_DATA.md for placement notes."
                 )
 
             df = pd.read_csv(DATA_PATH, encoding="cp1252")
@@ -87,6 +90,9 @@ def main():
                 random_state=RANDOM_STATE,
                 stratify=df["target"],
             )
+            # Matches the previous classifier cv=5 behavior, with identical
+            # positional folds reused for every representation and k value.
+            CV_SPLITS = list(StratifiedKFold(n_splits=5, shuffle=False).split(X_train, y_train))
 
             print("Rows:", len(df))
             print("Train/test:", len(X_train), len(X_test))
@@ -100,22 +106,19 @@ def main():
             Three representations are compared:
 
             - TF-IDF with unigrams and bigrams.
-            - Word2Vec-style sentence vectors created by averaging word embeddings trained on the SMS corpus.
-            - BERT sentence embeddings from `bert-base-uncased` using mean pooling.
+            - Word2Vec-style sentence vectors created by averaging word embeddings trained on each fold's training text.
+            - Frozen BERT sentence embeddings from `bert-base-uncased` using mean pooling.
+
+            TF-IDF and Word2Vec are fitted inside the KNN cross-validation pipeline.
+            Validation text is transformed with that fold's fitted representation only.
+            After selecting k by mean spam F1, the full pipeline is refitted on the
+            80% training split. The 20% test split is used only for final evaluation.
+            BERT is never fine-tuned or adapted on this corpus, so its independent
+            per-message embeddings can be computed once before KNN cross-validation.
             """
         ),
         code(
             """
-            def tune_knn(X_train_features, y_train, k_values=K_VALUES):
-                scores = []
-                for k in k_values:
-                    model = KNeighborsClassifier(n_neighbors=k, n_jobs=-1)
-                    cv_scores = cross_val_score(model, X_train_features, y_train, cv=5, scoring="f1")
-                    scores.append({"k": k, "cv_f1": cv_scores.mean(), "cv_f1_std": cv_scores.std()})
-                best = max(scores, key=lambda row: row["cv_f1"])
-                return best, pd.DataFrame(scores)
-
-
             def evaluate_model(name, model, X_test_features, y_test):
                 preds = model.predict(X_test_features)
                 precision, recall, f1, _ = precision_recall_fscore_support(
@@ -140,16 +143,14 @@ def main():
             """
             # TF-IDF + KNN
             start = time.time()
-            tfidf = TfidfVectorizer(ngram_range=(1, 2), max_features=5000)
-            X_train_tfidf = tfidf.fit_transform(X_train)
-            X_test_tfidf = tfidf.transform(X_test)
-
-            best_tfidf, tfidf_cv = tune_knn(X_train_tfidf, y_train)
-            knn_tfidf = KNeighborsClassifier(n_neighbors=int(best_tfidf["k"]), n_jobs=-1)
-            knn_tfidf.fit(X_train_tfidf, y_train)
-            tfidf_result = evaluate_model("TF-IDF", knn_tfidf, X_test_tfidf, y_test)
+            best_tfidf, tfidf_cv, knn_tfidf = tune_knn(
+                X_train, y_train,
+                representation=TfidfVectorizer(ngram_range=(1, 2), max_features=5000),
+                k_values=K_VALUES, cv=CV_SPLITS,
+            )
+            tfidf_result = evaluate_model("TF-IDF", knn_tfidf, X_test, y_test)
             tfidf_result["best_k"] = int(best_tfidf["k"])
-            tfidf_result["dimensionality"] = X_train_tfidf.shape[1]
+            tfidf_result["dimensionality"] = len(knn_tfidf.named_steps["representation"].vocabulary_)
             tfidf_result["runtime_seconds"] = time.time() - start
 
             tfidf_cv
@@ -158,41 +159,16 @@ def main():
         code(
             """
             # Word2Vec averaged embeddings + KNN
-            def tokenize(text):
-                text = text.lower()
-                text = re.sub(r"[^a-zA-Z\\s]", " ", text)
-                return text.split()
-
-
-            def sentence_vector(tokens, model, vector_size):
-                vectors = [model.wv[word] for word in tokens if word in model.wv]
-                if not vectors:
-                    return np.zeros(vector_size)
-                return np.mean(vectors, axis=0)
-
-
             start = time.time()
-            train_tokens = X_train.apply(tokenize)
-            test_tokens = X_test.apply(tokenize)
-
-            vector_size = 100
-            w2v = Word2Vec(
-                sentences=train_tokens,
-                vector_size=vector_size,
-                window=5,
-                min_count=1,
-                workers=4,
-                seed=RANDOM_STATE,
+            best_w2v, w2v_cv, knn_w2v = tune_knn(
+                X_train, y_train,
+                representation=MeanWord2Vec(vector_size=100, window=5, min_count=1,
+                                           workers=1, seed=RANDOM_STATE),
+                k_values=K_VALUES, cv=CV_SPLITS,
             )
-            X_train_w2v = np.vstack([sentence_vector(tokens, w2v, vector_size) for tokens in train_tokens])
-            X_test_w2v = np.vstack([sentence_vector(tokens, w2v, vector_size) for tokens in test_tokens])
-
-            best_w2v, w2v_cv = tune_knn(X_train_w2v, y_train)
-            knn_w2v = KNeighborsClassifier(n_neighbors=int(best_w2v["k"]), n_jobs=-1)
-            knn_w2v.fit(X_train_w2v, y_train)
-            w2v_result = evaluate_model("Word2Vec average", knn_w2v, X_test_w2v, y_test)
+            w2v_result = evaluate_model("Word2Vec average", knn_w2v, X_test, y_test)
             w2v_result["best_k"] = int(best_w2v["k"])
-            w2v_result["dimensionality"] = X_train_w2v.shape[1]
+            w2v_result["dimensionality"] = knn_w2v.named_steps["representation"].vector_size
             w2v_result["runtime_seconds"] = time.time() - start
 
             w2v_cv
@@ -232,13 +208,15 @@ def main():
             tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
             bert = BertModel.from_pretrained("bert-base-uncased").to(device)
             bert.eval()
+            bert.requires_grad_(False)
 
             X_train_bert = encode_texts_batch(X_train, tokenizer, bert)
-            X_test_bert = encode_texts_batch(X_test, tokenizer, bert)
 
-            best_bert, bert_cv = tune_knn(X_train_bert, y_train)
-            knn_bert = KNeighborsClassifier(n_neighbors=int(best_bert["k"]), n_jobs=-1)
-            knn_bert.fit(X_train_bert, y_train)
+            best_bert, bert_cv, knn_bert = tune_knn(
+                X_train_bert, y_train, representation="passthrough",
+                k_values=K_VALUES, cv=CV_SPLITS,
+            )
+            X_test_bert = encode_texts_batch(X_test, tokenizer, bert)
             bert_result = evaluate_model("BERT", knn_bert, X_test_bert, y_test)
             bert_result["best_k"] = int(best_bert["k"])
             bert_result["dimensionality"] = X_train_bert.shape[1]
@@ -269,7 +247,7 @@ def main():
             """
             ## 6) Error Analysis
 
-            The public notebook does not print raw SMS examples by default because the dataset includes phone numbers, URLs, and personal message text. The original coursework found:
+            The public notebook does not print raw SMS examples by default because the dataset includes phone numbers, URLs, and personal message text. The following are historical coursework observations, not findings from a rerun of the corrected pipeline:
 
             - TF-IDF misses contextual spam patterns and struggles when spam lacks obvious trigger words.
             - Averaged Word2Vec loses word order and weakens negation.
@@ -297,10 +275,25 @@ def main():
             """
             ## 7) Discussion / Limits
 
-            BERT produced the strongest spam-class F1 in the coursework, while TF-IDF was fastest and Word2Vec offered a strong speed/quality tradeoff. Limitations include a small benchmark dataset, possible dated SMS language, compute cost for BERT, and privacy concerns around raw SMS text.
+            The historical coursework reported BERT as strongest by spam F1, TF-IDF
+            as fastest, and Word2Vec as a speed/quality tradeoff. Those rankings and
+            timings have not been revalidated after correcting representation
+            fitting within cross-validation. The original test split was separate;
+            the CV issue alone does not establish that its reported scores were
+            incorrect. Refit and rerun with the original CSV before publishing
+            updated metrics. Word2Vec now uses one worker for reproducibility;
+            set PYTHONHASHSEED=0 before starting Python/Jupyter for repeatable word
+            initialization across processes. Corrected runtimes include fold-local
+            representation fitting and are not directly comparable with old timings.
+
+            Limitations include a small benchmark dataset, possible dated SMS
+            language, compute cost for BERT, and privacy concerns around raw SMS text.
             """
         ),
     ]
+
+    for index, cell in enumerate(cells):
+        cell["id"] = f"sms-{index:02d}"
 
     notebook = {
         "cells": cells,
